@@ -36,9 +36,9 @@ Notes:
   positives. Fine for personal use; distribution would need a code-signing
   certificate.
 - **Upload from the frozen exe** shells out to `python` on PATH to run the
-  external SleepHQ uploader (`SLEEPHQ_UPLOADER`, default
-  `~/cpap/sleephq_upload.py`) — the exe itself is not a Python interpreter.
-  If no Python is on PATH, run the upload stage separately.
+  bundled SleepHQ uploader (`SLEEPHQ_UPLOADER`, default `sleephq/upload.py`
+  next to the app) — the exe itself is not a Python interpreter. If no Python
+  is on PATH, run the upload stage separately.
 
 ## 3. From WSL (development convenience)
 

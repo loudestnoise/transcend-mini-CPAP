@@ -149,6 +149,12 @@ class TestAutoPort(unittest.TestCase):
         transport.find_port = lambda: value
         self.addCleanup(lambda: setattr(transport, "find_port", orig))
 
+    def _patch_wsl(self, value):
+        # These tests must not depend on where they happen to run.
+        orig = transport.is_wsl
+        transport.is_wsl = lambda: value
+        self.addCleanup(lambda: setattr(transport, "is_wsl", orig))
+
     def test_auto_resolves_to_detected_dev_node(self):
         self._patch_find("/dev/cu.usbserial-XYZ")
         t = transport.make_transport("auto")
@@ -157,9 +163,59 @@ class TestAutoPort(unittest.TestCase):
 
     def test_auto_with_nothing_attached_raises_helpfully(self):
         self._patch_find(None)
+        self._patch_wsl(False)
         with self.assertRaises(transport.TransportError) as cm:
             transport.make_transport("auto")
         self.assertIn("no Transcend USB-serial device", str(cm.exception))
+
+    def test_auto_under_wsl_falls_back_to_the_powershell_bridge(self):
+        # Under WSL the device is on the Windows side, so find_port() is
+        # structurally blind to it -- "auto" must still reach it, not fail.
+        self._patch_find(None)
+        self._patch_wsl(True)
+        t = transport.make_transport("auto")
+        self.assertIsInstance(t, transport.PowershellTransport)
+        self.assertEqual(t.port_name, transport.WSL_DEFAULT_PORT)
+
+    def test_auto_prefers_a_real_device_over_the_wsl_fallback(self):
+        # A usbipd-attached port under WSL is visible by VID:PID; take it.
+        self._patch_find("/dev/ttyUSB0")
+        self._patch_wsl(True)
+        t = transport.make_transport("auto")
+        self.assertIsInstance(t, transport.PySerialTransport)
+        self.assertEqual(t.port_name, "/dev/ttyUSB0")
+
+    def test_explicit_powershell_bridge_survives_auto(self):
+        # The bridge can only ever drive a COM port, so asking for it by name
+        # must not be defeated by a VID:PID scan finding nothing.
+        self._patch_find(None)
+        self._patch_wsl(False)
+        t = transport.make_transport("auto", "powershell")
+        self.assertIsInstance(t, transport.PowershellTransport)
+        self.assertEqual(t.port_name, transport.WSL_DEFAULT_PORT)
+
+    def test_explicit_powershell_bridge_ignores_a_found_dev_node(self):
+        # Regression: a usbipd-attached device under WSL made find_port()
+        # return /dev/ttyUSB0, which was then handed to pap.ps1 -Port. The
+        # bridge cannot drive a Linux device node -- it must stay on COMx.
+        self._patch_find("/dev/ttyUSB0")
+        self._patch_wsl(True)
+        t = transport.make_transport("auto", "powershell")
+        self.assertIsInstance(t, transport.PowershellTransport)
+        self.assertEqual(t.port_name, transport.WSL_DEFAULT_PORT)
+
+    def test_missing_pyserial_is_not_reported_as_a_missing_device(self):
+        # "no driver" and "no device" need different fixes, so the message
+        # must name pyserial rather than telling you to check your cable.
+        import types
+        for m in ("serial.tools.list_ports", "serial.tools", "serial"):
+            sys.modules[m] = None       # force ImportError on import
+        self.addCleanup(lambda: [sys.modules.pop(m, None) for m in
+                                 ("serial.tools.list_ports", "serial.tools", "serial")])
+        with self.assertRaises(transport.TransportError) as cm:
+            transport.find_port()
+        self.assertIn("pyserial", str(cm.exception))
+        self.assertNotIn("no Transcend USB-serial device", str(cm.exception))
 
     def test_find_port_matches_vid_pid(self):
         # find_port() reads serial.tools.list_ports; fake it to prove the match.
@@ -238,6 +294,38 @@ class TestCollect(unittest.TestCase):
                              log=lambda *_: None)
         # no third block request after the partial one
         self.assertEqual(sum(1 for c in ft.commands if c.startswith("Ta9")), 3)
+
+    def test_short_response_raises_instead_of_ending_the_walk(self):
+        # A truncated response used to be indistinguishable from "end of data":
+        # both just stopped, and the dump looked healthy but was missing nights.
+        m = self._mapping()
+        full = m["Ta9%04X%04X" % (self.ADDR + 50, 1000)]
+        m["Ta9%04X%04X" % (self.ADDR + 1050, 1000)] = full[:3 + 1000]   # half a block
+        ft = FakeTransport(m)
+        with tempfile.TemporaryDirectory() as d:
+            dump = os.path.join(d, "x")
+            with self.assertRaises(transport.TransportError) as cm:
+                tcollect.collect("COM_TEST", dump, transport=ft, log=lambda *_: None)
+            self.assertIn("truncated", str(cm.exception))
+            self.assertIn("INCOMPLETE", str(cm.exception))
+            # the partial dump is still written, and marks where it stopped
+            body = open(dump).read()
+            self.assertIn("SHORTBLOCK", body)
+            # parse.py ignores the marker (it matches "BLOCK ", with the space)
+            _, events = parse.load_events(dump)
+            self.assertEqual(len(events), 300)      # 200 full + 100 from the short block
+
+    def test_full_block_padded_with_ff_is_a_clean_end(self):
+        # The other half of the distinction: a FULL response that runs into the
+        # unwritten region is the normal, silent way a pull finishes.
+        ft = FakeTransport(self._mapping())
+        with tempfile.TemporaryDirectory() as d:
+            dump = os.path.join(d, "x")
+            blocks = tcollect.collect("COM_TEST", dump, transport=ft, log=lambda *_: None)
+            body = open(dump).read()
+        self.assertEqual(blocks, 2)
+        self.assertNotIn("SHORTBLOCK", body)
+        self.assertNotIn("BLOCKERR", body)
 
     def test_dead_device_raises(self):
         ft = FakeTransport({"Tbd": "", "Tff": "", "Ta8": ""})
